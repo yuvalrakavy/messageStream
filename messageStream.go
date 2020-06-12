@@ -2,6 +2,7 @@ package messageStream
 
 import (
 	"bytes"
+	ctx "context"
 	"encoding/binary"
 	"encoding/xml"
 	"fmt"
@@ -18,7 +19,7 @@ type EndPoint struct {
 	requestId int // Causality is used to associate reply packets with their corresponding requests
 	mutex     sync.Mutex
 
-	pendingRequests  map[int]chan Packet
+	pendingRequests  map[int]chan SubmitResult
 	onStreamClosed   func()
 	onPacketReceived func(packet *Packet)
 
@@ -37,13 +38,20 @@ type Service struct {
 	onPacketReceived func(packet *Packet)
 }
 
+type SubmitResult struct {
+	Reply *Packet
+	Error error
+}
+
+var ErrEndPointDisconnected = fmt.Errorf("EndPoint disconnnected")
+
 const RequestIdAttributeName = "_RequestId"
 
 func NewEndPoint(name string, connection net.Conn, onPacketReceived func(packet *Packet)) *EndPoint {
 	endPoint := EndPoint{
 		connection:       connection,
 		requestId:        0,
-		pendingRequests:  make(map[int]chan Packet),
+		pendingRequests:  make(map[int]chan SubmitResult),
 		Name:             name,
 		onPacketReceived: onPacketReceived,
 		Id:               -1,
@@ -161,23 +169,44 @@ func (packet *Packet) Send() error {
 //
 //   For example: pingResult := <- endPoint.Request(Attributes{"Type" : "Ping"}).Submit()
 //
-func (packet *Packet) Submit() chan Packet {
+func (packet *Packet) Submit(ctx ctx.Context) chan SubmitResult {
 	if packet.EndPoint == nil || packet.Name != "Request" {
 		log.Fatalln("Trying to submit invalid packet (only Request packets can be submitted", packet)
 	}
 
-	replyChannel := make(chan Packet)
-	packet.EndPoint.mutex.Lock()
+	endPoint := packet.EndPoint
+	replyChannel := make(chan SubmitResult)
+	requestReplyChannel := make(chan SubmitResult)
 
-	packet.EndPoint.requestId += 1
-	packet.Attributes[RequestIdAttributeName] = strconv.Itoa(packet.EndPoint.requestId)
-	packet.EndPoint.pendingRequests[packet.EndPoint.requestId] = replyChannel
+	endPoint.mutex.Lock()
 
-	packet.EndPoint.mutex.Unlock()
+	endPoint.requestId += 1
+	requestId := endPoint.requestId
 
-	err := packet.EndPoint.sendPacket(&packet.Element)
+	packet.Attributes[RequestIdAttributeName] = strconv.Itoa(requestId)
+	endPoint.pendingRequests[requestId] = requestReplyChannel
+
+	endPoint.mutex.Unlock()
+
+	err := endPoint.sendPacket(&packet.Element)
 	if err != nil {
-		log.Println("Error sending packet:", packet)
+		log.Println("Error submitting packet:", packet)
+		endPoint.removePendingRequest(requestId)
+
+		go func() {
+			replyChannel <- SubmitResult{nil, err}
+		}()
+	} else {
+		go func() {
+			select {
+			case <-ctx.Done():
+				endPoint.removePendingRequest(requestId)
+				replyChannel <- SubmitResult{nil, ctx.Err()}
+
+			case r := <-requestReplyChannel:
+				replyChannel <- SubmitResult{r.Reply, r.Error}
+			}
+		}()
 	}
 
 	return replyChannel
@@ -224,6 +253,12 @@ func (endPoint *EndPoint) sendPacket(element *Element) error {
 	return endPoint.sendPacketBytes(packetBytes)
 }
 
+func (endPoint *EndPoint) removePendingRequest(requestId int) {
+	endPoint.Lock("delete pending request")
+	delete(endPoint.pendingRequests, requestId)
+	endPoint.Unlock("delete pedning request")
+}
+
 func (endPoint *EndPoint) processInput() {
 	for {
 		packetBytes, err := endPoint.readPacketBytes()
@@ -249,11 +284,10 @@ func (endPoint *EndPoint) processInput() {
 				pendingReplyChannel, foundPendingRequest := endPoint.pendingRequests[requestId]
 
 				if foundPendingRequest {
-					endPoint.Lock("delete pending request")
-					delete(endPoint.pendingRequests, requestId)
-					endPoint.Unlock("delete pedning request")
+					endPoint.removePendingRequest(requestId)
 
-					pendingReplyChannel <- packet
+					pendingReplyChannel <- SubmitResult{&packet, nil}
+					close(pendingReplyChannel)
 				} else {
 					log.Println("Received reply packet with no pending request: ", packet)
 				}
@@ -270,6 +304,7 @@ func (endPoint *EndPoint) processInput() {
 	}
 
 	for _, pendingReplyChannel := range endPoint.pendingRequests {
+		pendingReplyChannel <- SubmitResult{nil, ErrEndPointDisconnected}
 		close(pendingReplyChannel)
 	}
 
