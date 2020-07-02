@@ -50,6 +50,21 @@ var ErrEndPointDisconnected = fmt.Errorf("EndPoint disconnnected")
 const RequestIdAttributeName = "_RequestId"
 const CausalityAttributeName = "Causality"
 
+// Create a new end point and associate it with a connection
+//
+// name - the end point's name. When calling NewEndPoint from a service createEndPoint call back,
+//        you can use an empty string to assign default name (serivce name with end point id suffix)
+//
+// Usually you will assign packet recieved callback
+// also do not forget to start the end point if not created in the context of a service createEndPoint callback
+//
+// Example:
+//
+//	conn, err := net.Dial("tcp", "someserver.com")
+//  endPoint := ms.NewEndPoint("MyConnection", conn).OnPacketReceived(func (packet *msPacket) {
+//		fmt.Println("Received:", packet)
+//	}).Start()
+//
 func NewEndPoint(name string, connection net.Conn) *EndPoint {
 	endPoint := EndPoint{
 		connection:      connection,
@@ -64,16 +79,32 @@ func NewEndPoint(name string, connection net.Conn) *EndPoint {
 	return &endPoint
 }
 
+// Add packet receive handler (function called when a new packet is received)
+//
 func (endPoint *EndPoint) OnPacketReceived(f func(packet *Packet)) *EndPoint {
 	endPoint.onPacketReceived = append(endPoint.onPacketReceived, f)
 	return endPoint
 }
 
+// Add end point close handler (function called when end point is closed)
+//
+// end point is either explicitly closed by calling endPoint.Close() or when
+// the connection is terminated
+//
 func (endPoint *EndPoint) OnClose(f func(endPoint *EndPoint)) *EndPoint {
 	endPoint.onClose = append(endPoint.onClose, f)
 	return endPoint
 }
 
+// Start (activate the end point)
+//
+// The following code is typical for creating a client side end point
+//
+//	conn, err := net.Dial("tcp", "someserver.com")
+//  endPoint := ms.NewEndPoint("MyConnection", conn).OnPacketReceived(func (packet *msPacket) {
+//		fmt.Println("Received:", packet)
+//	}).Start()
+//
 func (endPoint *EndPoint) Start() *EndPoint {
 	go endPoint.receivePackets()
 	go endPoint.sendPackets()
@@ -82,6 +113,8 @@ func (endPoint *EndPoint) Start() *EndPoint {
 	return endPoint
 }
 
+// Close the end point and disconnect it
+//
 func (endPoint *EndPoint) Close() error {
 	var err error = nil
 
@@ -125,6 +158,21 @@ func (endPoint *EndPoint) IsStarted() bool {
 	return endPoint.started
 }
 
+//
+//  Create a new service (server side):
+//
+//  name - service name
+//  metwork, address - where sevice will listen
+//  createEndPoint - function that associats end point with accepted connection
+//
+//  Example:
+//
+//  myService := ms.NewService("My service", "tcp", ":1000", func (service *ms.Service, conn ney.Conn) *ms.EndPoint) {
+//		return ms.NewEndPoint("", conn).OnPacketReceived(func (packet *ms.Packet) {
+//			// Do something with the packet...
+//		})
+//	})
+//
 func NewService(name string, network string, address string, createEndPoint func(service *Service, conn net.Conn) *EndPoint) *Service {
 	service := Service{
 		Name:           name,
@@ -138,6 +186,9 @@ func NewService(name string, network string, address string, createEndPoint func
 	return &service
 }
 
+//
+// Terminate a service
+//
 func (service *Service) Terminate() {
 	if service.listener != nil {
 		service.listener.Close()

@@ -26,6 +26,13 @@ type BroadcastPacket struct {
 
 type Attributes map[string]interface{}
 
+// Create new element with a given name
+// You can add any number of attributes or child elements
+//
+// For example:
+//
+//  element := ms.NewElement("Message", &Attributes{"Type" : "Warning", "Context" : "Unknwon", "Id": 1}, NewElement("Child"))
+//
 func NewElement(name string, content ...interface{}) *Element {
 	element := Element{Name: name, Attributes: make(Attributes)}
 
@@ -34,6 +41,8 @@ func NewElement(name string, content ...interface{}) *Element {
 	return &element
 }
 
+// Add content (element or attributes) to an element
+//
 func (element *Element) Add(content ...interface{}) *Element {
 	return element.addItems(content)
 }
