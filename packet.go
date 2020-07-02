@@ -10,28 +10,28 @@ import (
 
 type Element struct {
 	Name       string
-	Attributes map[string]string
+	Attributes Attributes
 	Children   []interface{}
 }
 
 type Packet struct {
-	Element
+	Element  *Element
 	EndPoint *EndPoint
 }
 
 type BroadcastPacket struct {
-	Element
+	Element *Element
 	Service *Service
 }
 
 type Attributes map[string]interface{}
 
-func NewElement(name string, content ...interface{}) Element {
-	element := Element{Name: name, Attributes: make(map[string]string)}
+func NewElement(name string, content ...interface{}) *Element {
+	element := Element{Name: name, Attributes: make(Attributes)}
 
 	element.addItems(content)
 
-	return element
+	return &element
 }
 
 func (element *Element) Add(content ...interface{}) *Element {
@@ -92,23 +92,23 @@ func (packet BroadcastPacket) String() string {
 }
 
 func (element *Element) GetAttribute(name string, defaultValue string) string {
-	valueAsString, hasValue := element.Attributes[name]
+	value, hasValue := element.Attributes[name]
 
 	if hasValue {
-		return valueAsString
+		return toString(value)
 	} else {
 		return defaultValue
 	}
 }
 
 func (element *Element) GetIntAttribute(name string, defaultValue int) int {
-	valueAsString, hasValue := element.Attributes[name]
+	value, hasValue := element.Attributes[name]
 
 	if hasValue {
-		value, err := strconv.Atoi(valueAsString)
+		value, err := strconv.Atoi(toString(value))
 
 		if err != nil {
-			panic(fmt.Sprintf("Element %#v - Attribute %v has value which is not valid integer: %v", element, name, valueAsString))
+			panic(fmt.Sprintf("Element %#v - Attribute %v has value which is not valid integer: %v", element, name, value))
 		}
 
 		return value
@@ -118,9 +118,11 @@ func (element *Element) GetIntAttribute(name string, defaultValue int) int {
 }
 
 func (element *Element) GetBoolAttribute(name string, defaultValue bool) bool {
-	valueAsString, hasValue := element.Attributes[name]
+	value, hasValue := element.Attributes[name]
 
 	if hasValue {
+		valueAsString := toString(value)
+
 		if strings.EqualFold(valueAsString, "true") {
 			return true
 		} else if strings.EqualFold(valueAsString, "false") {

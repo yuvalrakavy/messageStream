@@ -16,26 +16,28 @@ import (
 type EndPoint struct {
 	connection net.Conn
 
-	requestId int // Causality is used to associate reply packets with their corresponding requests
+	requestId int // requestId is used to associate reply packets with their corresponding requests
 	mutex     sync.Mutex
 
 	pendingRequests  map[int]chan SubmitResult
-	onStreamClosed   func()
-	onPacketReceived func(packet *Packet)
+	sendChannel      chan *Element
+	onClose          []func(endPoint *EndPoint)
+	onPacketReceived []func(packet *Packet)
 
-	Service *Service
-	Name    string
-	Id      int
-	Info    interface{}
+	Service      *Service
+	Name         string
+	Id           int
+	Info         interface{}
+	started      bool
+	UseCausality bool // Use Causality attribute in addition to _RequestID for backward compatability
 }
 
 type Service struct {
-	Name             string
-	endPoints        map[int]*EndPoint
-	listener         net.Listener
-	nextEndPointId   int
-	onNewEndPoint    func(endPoint *EndPoint)
-	onPacketReceived func(packet *Packet)
+	Name           string
+	endPoints      map[int]*EndPoint
+	listener       net.Listener
+	nextEndPointId int
+	createEndPoint func(service *Service, connection net.Conn) *EndPoint
 }
 
 type SubmitResult struct {
@@ -46,29 +48,89 @@ type SubmitResult struct {
 var ErrEndPointDisconnected = fmt.Errorf("EndPoint disconnnected")
 
 const RequestIdAttributeName = "_RequestId"
+const CausalityAttributeName = "Causality"
 
-func NewEndPoint(name string, connection net.Conn, onPacketReceived func(packet *Packet)) *EndPoint {
+func NewEndPoint(name string, connection net.Conn) *EndPoint {
 	endPoint := EndPoint{
-		connection:       connection,
-		requestId:        0,
-		pendingRequests:  make(map[int]chan SubmitResult),
-		Name:             name,
-		onPacketReceived: onPacketReceived,
-		Id:               -1,
+		connection:      connection,
+		requestId:       0,
+		pendingRequests: make(map[int]chan SubmitResult),
+		sendChannel:     make(chan *Element),
+		Name:            name,
+		Id:              -1,
+		started:         false,
 	}
-
-	go endPoint.processInput()
 
 	return &endPoint
 }
 
-func NewService(name string, network string, address string, onNewEndPoint func(endPoint *EndPoint), onPacketReceived func(packet *Packet)) *Service {
+func (endPoint *EndPoint) OnPacketReceived(f func(packet *Packet)) *EndPoint {
+	endPoint.onPacketReceived = append(endPoint.onPacketReceived, f)
+	return endPoint
+}
+
+func (endPoint *EndPoint) OnClose(f func(endPoint *EndPoint)) *EndPoint {
+	endPoint.onClose = append(endPoint.onClose, f)
+	return endPoint
+}
+
+func (endPoint *EndPoint) Start() *EndPoint {
+	go endPoint.receivePackets()
+	go endPoint.sendPackets()
+	endPoint.started = true
+
+	return endPoint
+}
+
+func (endPoint *EndPoint) Close() error {
+	var err error = nil
+
+	if endPoint.connection != nil {
+		close(endPoint.sendChannel)
+
+		for _, onStreamClose := range endPoint.onClose {
+			onStreamClose(endPoint)
+		}
+
+		for _, pendingReplyChannel := range endPoint.pendingRequests {
+			pendingReplyChannel <- SubmitResult{nil, ErrEndPointDisconnected}
+			close(pendingReplyChannel)
+		}
+
+		// Set endPoint.connection to nil before closing the connection, because calling the connection
+		// will call Close again
+		//
+		conn := endPoint.connection
+		endPoint.connection = nil
+
+		err = conn.Close()
+
+		endPoint.onPacketReceived = nil
+		endPoint.onClose = nil
+
+		fmt.Printf("MessageStream %v closed\n", endPoint.Name)
+	}
+
+	return err
+}
+
+func (endPoint *EndPoint) IsConnected() error {
+	if endPoint.connection == nil {
+		return fmt.Errorf("EndPoint %v is not connected", endPoint)
+	}
+	return nil
+}
+
+func (endPoint *EndPoint) IsStarted() bool {
+	return endPoint.started
+}
+
+func NewService(name string, network string, address string, createEndPoint func(service *Service, conn net.Conn) *EndPoint) *Service {
 	service := Service{
-		Name:             name,
-		endPoints:        make(map[int]*EndPoint),
-		nextEndPointId:   0,
-		onNewEndPoint:    onNewEndPoint,
-		onPacketReceived: onPacketReceived,
+		Name:           name,
+		endPoints:      make(map[int]*EndPoint),
+		nextEndPointId: 0,
+		createEndPoint: createEndPoint,
 	}
 
 	go service.acceptStreams(network, address)
@@ -91,7 +153,7 @@ func (service *Service) Terminate() {
 	}
 
 	for _, endPoint := range endPoints {
-		endPoint.connection.Close()
+		endPoint.Close()
 	}
 }
 
@@ -129,17 +191,36 @@ func (endPoint *EndPoint) Request(content ...interface{}) *Packet {
 	return endPoint.newPacket("Request", content)
 }
 
+func (requestPacket *Packet) GetRequestId() (int, error) {
+	if id := requestPacket.Element.GetIntAttribute(RequestIdAttributeName, -1); id >= 0 {
+		return id, nil
+	} else if id := requestPacket.Element.GetIntAttribute(CausalityAttributeName, -1); id >= 0 {
+		return id, nil
+	} else {
+		return -1, fmt.Errorf("Packet: %v  has no request ID - cannot reply", requestPacket)
+	}
+}
+
 //
 // Create a reply to a request
 //
 //  didSundayArrivedRequest.Reply(Attributes{"Answer" : true}).Send()
 //
 func (requestPacket *Packet) Reply(content ...interface{}) *Packet {
-	if requestPacket.EndPoint != nil && requestPacket.Name == "Request" {
-		content = append(content, Attributes{RequestIdAttributeName: requestPacket.GetAttribute(RequestIdAttributeName, "-1")})
-		return requestPacket.EndPoint.newPacket("Reply", content)
+	if requestPacket.EndPoint != nil {
+		if requestId, err := requestPacket.GetRequestId(); err == nil {
+			content = append(content, Attributes{RequestIdAttributeName: requestId})
+			if requestPacket.EndPoint.UseCausality {
+				content = append(content, Attributes{CausalityAttributeName: requestId})
+			}
+
+			return requestPacket.EndPoint.newPacket("Reply", content)
+		} else {
+			log.Fatalln(err.Error())
+			return nil
+		}
 	} else {
-		log.Fatalln("Trying to reply to wrong packet type (not a valid request packet): ", requestPacket)
+		log.Fatalln("Trying to reply packet with closed connection: ", requestPacket)
 		return nil
 	}
 }
@@ -156,8 +237,8 @@ func (requestPacket *Packet) Reply(content ...interface{}) *Packet {
 //   pingRequest.Reply(Attributes{"Type", "PingResult"}).Send()
 //
 func (packet *Packet) Send() error {
-	if packet.EndPoint != nil && packet.Name != "Request" {
-		return packet.EndPoint.sendPacket(&packet.Element)
+	if packet.EndPoint != nil && packet.Element.Name != "Request" {
+		return packet.EndPoint.sendPacket(packet.Element)
 	} else {
 		log.Fatalln("Trying to send packet with the wrong type: ", packet)
 		return nil
@@ -170,11 +251,12 @@ func (packet *Packet) Send() error {
 //   For example: pingResult := <- endPoint.Request(Attributes{"Type" : "Ping"}).Submit()
 //
 func (packet *Packet) Submit(ctx ctx.Context) chan SubmitResult {
-	if packet.EndPoint == nil || packet.Name != "Request" {
+	if packet.EndPoint == nil || packet.Element.Name != "Request" {
 		log.Fatalln("Trying to submit invalid packet (only Request packets can be submitted", packet)
 	}
 
 	endPoint := packet.EndPoint
+
 	replyChannel := make(chan SubmitResult)
 	requestReplyChannel := make(chan SubmitResult)
 
@@ -183,18 +265,23 @@ func (packet *Packet) Submit(ctx ctx.Context) chan SubmitResult {
 	endPoint.requestId += 1
 	requestId := endPoint.requestId
 
-	packet.Attributes[RequestIdAttributeName] = strconv.Itoa(requestId)
+	packet.Element.Attributes[RequestIdAttributeName] = requestId
+	if packet.EndPoint.UseCausality {
+		packet.Element.Attributes[CausalityAttributeName] = requestId
+	}
+
 	endPoint.pendingRequests[requestId] = requestReplyChannel
 
 	endPoint.mutex.Unlock()
 
-	err := endPoint.sendPacket(&packet.Element)
+	err := endPoint.sendPacket(packet.Element)
 	if err != nil {
 		log.Println("Error submitting packet:", packet)
 		endPoint.removePendingRequest(requestId)
 
 		go func() {
 			replyChannel <- SubmitResult{nil, err}
+			close(replyChannel)
 		}()
 	} else {
 		go func() {
@@ -206,6 +293,8 @@ func (packet *Packet) Submit(ctx ctx.Context) chan SubmitResult {
 			case r := <-requestReplyChannel:
 				replyChannel <- SubmitResult{r.Reply, r.Error}
 			}
+
+			close(replyChannel)
 		}()
 	}
 
@@ -218,7 +307,7 @@ func (packet *Packet) Submit(ctx ctx.Context) chan SubmitResult {
 func (service *Service) Broadcast(packet *BroadcastPacket, sendPredicate func(endPoint *EndPoint, packet *BroadcastPacket) bool) error {
 	for _, endPoint := range service.endPoints {
 		if sendPredicate == nil || sendPredicate(endPoint, packet) {
-			err := endPoint.sendPacket(&packet.Element)
+			err := endPoint.sendPacket(packet.Element)
 			if err != nil {
 				return err
 			}
@@ -244,22 +333,25 @@ func (endPoint *EndPoint) newPacket(packetType string, content ...interface{}) *
 }
 
 func (endPoint *EndPoint) sendPacket(element *Element) error {
-	packetBytes, err := element.encode()
-
-	if err != nil {
+	if err := endPoint.IsConnected(); err != nil {
 		return err
 	}
 
-	return endPoint.sendPacketBytes(packetBytes)
+	if !endPoint.IsStarted() {
+		panic(fmt.Sprintf("Endpoint %v is not started - did you call endPoint.Start()?", endPoint))
+	}
+
+	endPoint.sendChannel <- element
+	return nil
 }
 
 func (endPoint *EndPoint) removePendingRequest(requestId int) {
-	endPoint.Lock("delete pending request")
+	endPoint.lock("delete pending request")
 	delete(endPoint.pendingRequests, requestId)
-	endPoint.Unlock("delete pedning request")
+	endPoint.unlock("delete pedning request")
 }
 
-func (endPoint *EndPoint) processInput() {
+func (endPoint *EndPoint) receivePackets() {
 	for {
 		packetBytes, err := endPoint.readPacketBytes()
 
@@ -267,18 +359,16 @@ func (endPoint *EndPoint) processInput() {
 			break
 		}
 
-		var packet Packet
+		var packet Packet = Packet{EndPoint: endPoint}
 
-		err = packet.Element.decode(packetBytes)
+		packet.Element, err = decode(packetBytes)
 
 		if err != nil {
 			log.Fatalln(fmt.Sprintf("MessageStream %s error while decoding incoming packet %v", endPoint.Name, err))
 		}
 
-		packet.EndPoint = endPoint
-
-		if packet.Name == "Reply" {
-			requestId := packet.GetIntAttribute(RequestIdAttributeName, -1)
+		if packet.Element.Name == "Reply" {
+			requestId := packet.Element.GetIntAttribute(RequestIdAttributeName, -1)
 
 			if requestId >= 0 {
 				pendingReplyChannel, foundPendingRequest := endPoint.pendingRequests[requestId]
@@ -294,21 +384,31 @@ func (endPoint *EndPoint) processInput() {
 			}
 		} else {
 			if endPoint.onPacketReceived != nil {
-				endPoint.onPacketReceived(&packet)
+				for _, onPacketReceived := range endPoint.onPacketReceived {
+					onPacketReceived(&packet)
+				}
 			}
 		}
 	}
 
-	if endPoint.onStreamClosed != nil {
-		endPoint.onStreamClosed()
+	endPoint.Close()
+}
+
+func (endPoint *EndPoint) sendPackets() {
+	for element := range endPoint.sendChannel {
+		packetBytes, err := element.encode()
+
+		if err != nil {
+			panic(err)
+		}
+
+		err = endPoint.sendPacketBytes(packetBytes)
+		if err != nil {
+			panic(err)
+		}
 	}
 
-	for _, pendingReplyChannel := range endPoint.pendingRequests {
-		pendingReplyChannel <- SubmitResult{nil, ErrEndPointDisconnected}
-		close(pendingReplyChannel)
-	}
-
-	fmt.Printf("MessageStream %v closed\n", endPoint.Name)
+	fmt.Println("MessageStream", endPoint, " sender terminated")
 }
 
 func (service *Service) acceptStreams(network string, address string) {
@@ -327,28 +427,31 @@ func (service *Service) acceptStreams(network string, address string) {
 			break
 		}
 
-		name := service.Name + " " + strconv.Itoa(service.nextEndPointId)
-		endPoint := NewEndPoint(name, connection, service.onPacketReceived)
-		endPoint.Id = service.nextEndPointId
-		endPoint.onStreamClosed = func() {
+		endPoint := service.createEndPoint(service, connection).OnClose(func(endPoint *EndPoint) {
 			delete(service.endPoints, endPoint.Id)
+		})
+
+		endPoint.Id = service.nextEndPointId
+		if endPoint.Name == "" {
+			endPoint.Name = service.Name + " " + strconv.Itoa(service.nextEndPointId)
 		}
 
 		service.endPoints[endPoint.Id] = endPoint
-
 		service.nextEndPointId += 1
+
+		endPoint.Start()
 	}
 
 	service.listener = nil
 	fmt.Printf("MessageStream Service %v terminated\n", service.Name)
 }
 
-func (endPoint *EndPoint) Lock(m string) {
+func (endPoint *EndPoint) lock(m string) {
 	//fmt.Println("Lock: ", m)
 	endPoint.mutex.Lock()
 }
 
-func (endPoint *EndPoint) Unlock(m string) {
+func (endPoint *EndPoint) unlock(m string) {
 	//fmt.Println("Unlock: ", m)
 	endPoint.mutex.Unlock()
 }
@@ -367,19 +470,23 @@ func (endPoint *EndPoint) sendPacketBytes(packetBytes []byte) error {
 }
 
 func (endPoint *EndPoint) readPacketBytes() ([]byte, error) {
-	countBytes := make([]byte, 4)
-	_, err := endPoint.connection.Read(countBytes)
+	if endPoint.connection != nil {
+		countBytes := make([]byte, 4)
+		_, err := endPoint.connection.Read(countBytes)
 
-	if err == io.EOF {
-		return nil, err
+		if err != nil {
+			return nil, io.EOF
+		}
+
+		count := binary.LittleEndian.Uint32(countBytes)
+		packetBytes := make([]byte, count)
+
+		_, err = endPoint.connection.Read(packetBytes)
+
+		return packetBytes, err
+	} else {
+		return nil, io.EOF
 	}
-
-	count := binary.LittleEndian.Uint32(countBytes)
-	packetBytes := make([]byte, count)
-
-	_, err = endPoint.connection.Read(packetBytes)
-
-	return packetBytes, err
 }
 
 func (endPoint *EndPoint) String() string {
@@ -408,7 +515,7 @@ func (element *Element) encodeElement(xmlEncoder *xml.Encoder) error {
 	var err error
 
 	for name, value := range element.Attributes {
-		attr = append(attr, xml.Attr{Name: xml.Name{Space: "", Local: name}, Value: value})
+		attr = append(attr, xml.Attr{Name: xml.Name{Space: "", Local: name}, Value: toString(value)})
 	}
 
 	xmlElement := xml.StartElement{Name: xml.Name{Space: "", Local: element.Name}, Attr: attr}
@@ -451,21 +558,23 @@ func (element *Element) encodeElement(xmlEncoder *xml.Encoder) error {
 	return err
 }
 
-func (element *Element) decode(packetPacket []byte) error {
+func decode(packetPacket []byte) (*Element, error) {
 	decoder := xml.NewDecoder(bytes.NewBuffer(packetPacket))
 
 	token, err := decoder.Token()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return element.decodeToken(decoder, token.(xml.StartElement))
+	return decodeToken(decoder, token.(xml.StartElement))
 }
 
-func (element *Element) decodeToken(decoder *xml.Decoder, startElement xml.StartElement) error {
-	element.Name = startElement.Name.Local
+func decodeToken(decoder *xml.Decoder, startElement xml.StartElement) (*Element, error) {
+	element := Element{
+		Name:       startElement.Name.Local,
+		Attributes: make(Attributes),
+	}
 
-	element.Attributes = make(map[string]string)
 	for _, attr := range startElement.Attr {
 		element.Attributes[attr.Name.Local] = attr.Value
 	}
@@ -476,7 +585,7 @@ func (element *Element) decodeToken(decoder *xml.Decoder, startElement xml.Start
 		aToken, err := decoder.Token()
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		switch token := aToken.(type) {
@@ -484,19 +593,17 @@ func (element *Element) decodeToken(decoder *xml.Decoder, startElement xml.Start
 			done = true
 
 		case xml.StartElement:
-			var childMessageElement Element
-
-			err = childMessageElement.decodeToken(decoder, token)
+			childElement, err := decodeToken(decoder, token)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
-			element.Children = append(element.Children, childMessageElement)
+			element.Children = append(element.Children, childElement)
 
 		case xml.CharData:
 			element.Children = append(element.Children, string(token))
 		}
 	}
 
-	return nil
+	return &element, nil
 }
