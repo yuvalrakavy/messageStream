@@ -34,6 +34,7 @@ type EndPoint struct {
 
 type Service struct {
 	Name           string
+	Info           interface{}
 	endPoints      map[int]*EndPoint
 	listener       net.Listener
 	nextEndPointId int
