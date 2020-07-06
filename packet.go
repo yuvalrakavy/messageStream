@@ -59,6 +59,11 @@ func (element *Element) addItems(content []interface{}) *Element {
 		case *Element:
 			element.Children = append(element.Children, item)
 
+		case []*Element:
+			for _, subElement := range item {
+				element.Add(subElement)
+			}
+
 		case []interface{}:
 			element.addItems(item)
 

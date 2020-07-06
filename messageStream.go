@@ -174,12 +174,13 @@ func (endPoint *EndPoint) IsStarted() bool {
 //		})
 //	})
 //
-func NewService(name string, network string, address string, createEndPoint func(service *Service, conn net.Conn) *EndPoint) *Service {
+func NewService(name string, network string, address string, info interface{}, createEndPoint func(service *Service, conn net.Conn) *EndPoint) *Service {
 	service := Service{
 		Name:           name,
 		endPoints:      make(map[int]*EndPoint),
 		nextEndPointId: 0,
 		createEndPoint: createEndPoint,
+		Info:           info,
 	}
 
 	go service.acceptStreams(network, address)
@@ -198,7 +199,7 @@ func (service *Service) Terminate() {
 	// Closing connection should remove the entry from the map, therefore first
 	// create an array with all the endpoints to avoid the map changing while iteratating
 	//
-	endPoints := make([]*EndPoint, len(service.endPoints))
+	var endPoints []*EndPoint
 
 	for _, endPoint := range service.endPoints {
 		endPoints = append(endPoints, endPoint)
@@ -243,6 +244,9 @@ func (endPoint *EndPoint) Request(content ...interface{}) *Packet {
 	return endPoint.newPacket("Request", content)
 }
 
+//
+// Return requestID (if one exists)
+//
 func (requestPacket *Packet) GetRequestId() (int, error) {
 	if id := requestPacket.Element.GetIntAttribute(RequestIdAttributeName, -1); id >= 0 {
 		return id, nil
@@ -251,6 +255,13 @@ func (requestPacket *Packet) GetRequestId() (int, error) {
 	} else {
 		return -1, fmt.Errorf("Packet: %v  has no request ID - cannot reply", requestPacket)
 	}
+}
+
+//
+// Get message/request type
+//
+func (packet *Packet) GetType() string {
+	return packet.Element.GetAttribute("Type", "*Missing*")
 }
 
 //
@@ -273,6 +284,29 @@ func (requestPacket *Packet) Reply(content ...interface{}) *Packet {
 		}
 	} else {
 		log.Fatalln("Trying to reply packet with closed connection: ", requestPacket)
+		return nil
+	}
+}
+
+//
+// Create exception packet
+//
+func (requestPacket *Packet) Exception(exception error, content ...interface{}) *Packet {
+	if requestPacket.EndPoint != nil {
+		if requestId, err := requestPacket.GetRequestId(); err == nil {
+			content = append(content, Attributes{"Description": exception.Error()})
+			content = append(content, Attributes{RequestIdAttributeName: requestId})
+			if requestPacket.EndPoint.UseCausality {
+				content = append(content, Attributes{CausalityAttributeName: requestId})
+			}
+
+			return requestPacket.EndPoint.newPacket("Exception", content)
+		} else {
+			log.Fatalln(err.Error())
+			return nil
+		}
+	} else {
+		log.Fatalln("Trying to generate exception for packet with closed connection: ", requestPacket)
 		return nil
 	}
 }
@@ -343,6 +377,7 @@ func (packet *Packet) Submit(ctx ctx.Context) chan SubmitResult {
 				replyChannel <- SubmitResult{nil, ctx.Err()}
 
 			case r := <-requestReplyChannel:
+
 				replyChannel <- SubmitResult{r.Reply, r.Error}
 			}
 
@@ -419,7 +454,7 @@ func (endPoint *EndPoint) receivePackets() {
 			log.Fatalln(fmt.Sprintf("MessageStream %s error while decoding incoming packet %v", endPoint.Name, err))
 		}
 
-		if packet.Element.Name == "Reply" {
+		if packet.Element.Name == "Reply" || packet.Element.Name == "Exception" {
 			requestId := packet.Element.GetIntAttribute(RequestIdAttributeName, -1)
 
 			if requestId >= 0 {
@@ -428,7 +463,12 @@ func (endPoint *EndPoint) receivePackets() {
 				if foundPendingRequest {
 					endPoint.removePendingRequest(requestId)
 
-					pendingReplyChannel <- SubmitResult{&packet, nil}
+					if packet.Element.Name == "Reply" {
+						pendingReplyChannel <- SubmitResult{&packet, nil}
+					} else {
+						pendingReplyChannel <- SubmitResult{&packet, fmt.Errorf("Exception: %v", packet.Element.GetAttribute("Description", "Exception has no description"))}
+					}
+
 					close(pendingReplyChannel)
 				} else {
 					log.Println("Received reply packet with no pending request: ", packet)
@@ -483,6 +523,7 @@ func (service *Service) acceptStreams(network string, address string) {
 			delete(service.endPoints, endPoint.Id)
 		})
 
+		endPoint.Service = service
 		endPoint.Id = service.nextEndPointId
 		if endPoint.Name == "" {
 			endPoint.Name = service.Name + " " + strconv.Itoa(service.nextEndPointId)
