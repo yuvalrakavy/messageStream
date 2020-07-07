@@ -53,6 +53,9 @@ func (element *Element) addItems(content []interface{}) *Element {
 		case Attributes:
 			element.SetAttributes(item)
 
+		case *Attributes:
+			element.SetAttributes(*item)
+
 		case Element:
 			element.Children = append(element.Children, &item)
 
@@ -79,6 +82,7 @@ func (element Element) String() string {
 	buffer := bytes.NewBuffer(nil)
 	xmlEncoder := xml.NewEncoder(buffer)
 
+	xmlEncoder.Indent(" ", "  ")
 	err := element.encodeElement(xmlEncoder)
 	xmlEncoder.Flush()
 
