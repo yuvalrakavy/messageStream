@@ -14,7 +14,7 @@ import (
 )
 
 type EndPoint struct {
-	connection net.Conn
+	Connection net.Conn
 
 	requestId int // requestId is used to associate reply packets with their corresponding requests
 	mutex     sync.Mutex
@@ -47,6 +47,7 @@ type SubmitResult struct {
 }
 
 var ErrEndPointDisconnected = fmt.Errorf("EndPoint disconnnected")
+var cancelSendPacket = &Packet{EndPoint: nil, Element: nil}
 
 const RequestIdAttributeName = "_RequestId"
 const CausalityAttributeName = "Causality"
@@ -68,10 +69,10 @@ const CausalityAttributeName = "Causality"
 //
 func NewEndPoint(name string, connection net.Conn) *EndPoint {
 	endPoint := EndPoint{
-		connection:      connection,
+		Connection:      connection,
 		requestId:       0,
 		pendingRequests: make(map[int]chan SubmitResult),
-		sendChannel:     make(chan *Element),
+		sendChannel:     make(chan *Element, 10),
 		Name:            name,
 		Id:              -1,
 		started:         false,
@@ -119,7 +120,7 @@ func (endPoint *EndPoint) Start() *EndPoint {
 func (endPoint *EndPoint) Close() error {
 	var err error = nil
 
-	if endPoint.connection != nil {
+	if endPoint.Connection != nil {
 		close(endPoint.sendChannel)
 
 		for _, onStreamClose := range endPoint.onClose {
@@ -131,25 +132,25 @@ func (endPoint *EndPoint) Close() error {
 			close(pendingReplyChannel)
 		}
 
-		// Set endPoint.connection to nil before closing the connection, because calling the connection
+		// Set endPoint.Connection to nil before closing the connection, because calling the connection
 		// will call Close again
 		//
-		conn := endPoint.connection
-		endPoint.connection = nil
+		conn := endPoint.Connection
+		endPoint.Connection = nil
 
 		err = conn.Close()
 
 		endPoint.onPacketReceived = nil
 		endPoint.onClose = nil
 
-		fmt.Printf("MessageStream %v closed\n", endPoint.Name)
+		log.Printf("MessageStream %v closed\n", endPoint.Name)
 	}
 
 	return err
 }
 
 func (endPoint *EndPoint) IsConnected() error {
-	if endPoint.connection == nil {
+	if endPoint.Connection == nil {
 		return fmt.Errorf("EndPoint %v is not connected", endPoint)
 	}
 	return nil
@@ -257,6 +258,16 @@ func (requestPacket *Packet) GetRequestId() (int, error) {
 	}
 }
 
+func (packet *Packet) IsRequest() bool {
+	id, err := packet.GetRequestId()
+
+	if id >= 0 && err == nil {
+		return true
+	} else {
+		return false
+	}
+}
+
 //
 // Get message/request type
 //
@@ -289,9 +300,21 @@ func (requestPacket *Packet) Reply(content ...interface{}) *Packet {
 }
 
 //
+// OptionalReply - create reply packet if the sending packet is request. Otherwise, return null
+//
+func (maybeRequestPacket *Packet) OptionalReply(content ...interface{}) *Packet {
+	if maybeRequestPacket.IsRequest() {
+		return maybeRequestPacket.Reply(content)
+	} else {
+		return cancelSendPacket
+	}
+}
+
+//
 // Create exception packet
 //
 func (requestPacket *Packet) Exception(exception error, content ...interface{}) *Packet {
+	fmt.Println("EXCEPTION:", exception.Error())
 	if requestPacket.EndPoint != nil {
 		if requestId, err := requestPacket.GetRequestId(); err == nil {
 			content = append(content, Attributes{"Description": exception.Error()})
@@ -323,6 +346,10 @@ func (requestPacket *Packet) Exception(exception error, content ...interface{}) 
 //   pingRequest.Reply(Attributes{"Type", "PingResult"}).Send()
 //
 func (packet *Packet) Send() error {
+	if packet == cancelSendPacket {
+		return nil
+	}
+
 	if packet.EndPoint != nil && packet.Element.Name != "Request" {
 		return packet.EndPoint.sendPacket(packet.Element)
 	} else {
@@ -499,8 +526,6 @@ func (endPoint *EndPoint) sendPackets() {
 			panic(err)
 		}
 	}
-
-	fmt.Println("MessageStream", endPoint, " sender terminated")
 }
 
 func (service *Service) acceptStreams(network string, address string) {
@@ -536,7 +561,7 @@ func (service *Service) acceptStreams(network string, address string) {
 	}
 
 	service.listener = nil
-	fmt.Printf("MessageStream Service %v terminated\n", service.Name)
+	log.Printf("MessageStream Service %v terminated\n", service.Name)
 }
 
 func (endPoint *EndPoint) lock(m string) {
@@ -553,19 +578,19 @@ func (endPoint *EndPoint) sendPacketBytes(packetBytes []byte) error {
 	countBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(countBytes, uint32(len(packetBytes)))
 
-	_, err := endPoint.connection.Write(countBytes)
+	_, err := endPoint.Connection.Write(countBytes)
 
 	if err == nil {
-		_, err = endPoint.connection.Write(packetBytes)
+		_, err = endPoint.Connection.Write(packetBytes)
 	}
 
 	return err
 }
 
 func (endPoint *EndPoint) readPacketBytes() ([]byte, error) {
-	if endPoint.connection != nil {
+	if endPoint.Connection != nil {
 		countBytes := make([]byte, 4)
-		_, err := endPoint.connection.Read(countBytes)
+		_, err := endPoint.Connection.Read(countBytes)
 
 		if err != nil {
 			return nil, io.EOF
@@ -574,7 +599,7 @@ func (endPoint *EndPoint) readPacketBytes() ([]byte, error) {
 		count := binary.LittleEndian.Uint32(countBytes)
 		packetBytes := make([]byte, count)
 
-		_, err = endPoint.connection.Read(packetBytes)
+		_, err = endPoint.Connection.Read(packetBytes)
 
 		return packetBytes, err
 	} else {
