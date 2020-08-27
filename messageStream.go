@@ -479,6 +479,8 @@ func (endPoint *EndPoint) receivePackets() {
 
 		if err != nil {
 			log.Fatalln(fmt.Sprintf("MessageStream %s error while decoding incoming packet %v", endPoint.Name, err))
+			fmt.Println("packetBytes length", len(packetBytes))
+			fmt.Println("packetBytes: ", packetBytes)
 		}
 
 		if packet.Element.Name == "Reply" || packet.Element.Name == "Exception" {
@@ -599,7 +601,16 @@ func (endPoint *EndPoint) readPacketBytes() ([]byte, error) {
 		count := binary.LittleEndian.Uint32(countBytes)
 		packetBytes := make([]byte, count)
 
-		_, err = endPoint.Connection.Read(packetBytes)
+		totalRead := 0
+		for totalRead < int(count) {
+			n, err := endPoint.Connection.Read(packetBytes[totalRead:])
+
+			if err != nil {
+				return packetBytes, err
+			}
+
+			totalRead += n
+		}
 
 		return packetBytes, err
 	} else {
