@@ -10,9 +10,39 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 )
 
+// Interface for something that act as a logger, this can be either
+// the logger returned by log.NewLogger or null logger which log nothing
+//
+type OptionalLogger interface {
+	Fatal(v ...interface{})
+	Fatalf(f string, v ...interface{})
+	Fatalln(v ...interface{})
+	Flags() int
+	Output(depth int, s string) error
+	Panic(v ...interface{})
+	Panicf(f string, v ...interface{})
+	Panicln(v ...interface{})
+	Prefix() string
+	Print(v ...interface{})
+	Printf(f string, v ...interface{})
+	Println(v ...interface{})
+	SetFlags(flag int)
+	SetOutput(w io.Writer)
+	SetPrefix(prefix string)
+	Writer() io.Writer
+}
+
+const LogEndPoint = "EndPoint"
+const LogMessages = "Messages"
+const LogService = "Service"
+
+//
+// EndPoint - a message stream end point is used to send/receive messages to another end point
+//
 type EndPoint struct {
 	Connection net.Conn
 
@@ -22,16 +52,21 @@ type EndPoint struct {
 	pendingRequests  map[int]chan SubmitResult
 	sendChannel      chan *Element
 	onClose          []func(endPoint *EndPoint)
-	onPacketReceived []func(packet *Packet)
+	onPacketReceived []func(packet *Packet) bool
+	loggers          *map[string]OptionalLogger
 
 	Service      *Service
-	Name         string
+	name         string
 	Id           int
 	Info         interface{}
 	started      bool
 	UseCausality bool // Use Causality attribute in addition to _RequestID for backward compatability
 }
 
+//
+// Service - wait for connection request, associate each incoming connection request with an end point
+// which then processes received messages
+//
 type Service struct {
 	Name           string
 	Info           interface{}
@@ -39,12 +74,15 @@ type Service struct {
 	listener       net.Listener
 	nextEndPointId int
 	createEndPoint func(service *Service, connection net.Conn) *EndPoint
+	loggers        *map[string]OptionalLogger
 }
 
 type SubmitResult struct {
 	Reply *Packet
 	Error error
 }
+
+type NullLogger struct{}
 
 var ErrEndPointDisconnected = fmt.Errorf("EndPoint disconnnected")
 var cancelSendPacket = &Packet{EndPoint: nil, Element: nil}
@@ -73,17 +111,19 @@ func NewEndPoint(name string, connection net.Conn) *EndPoint {
 		requestId:       0,
 		pendingRequests: make(map[int]chan SubmitResult),
 		sendChannel:     make(chan *Element, 10),
-		Name:            name,
+		name:            name,
 		Id:              -1,
 		started:         false,
+		loggers:         nil,
 	}
 
+	endPoint.Log(LogEndPoint).Println("New endpoint: ", &endPoint)
 	return &endPoint
 }
 
 // Add packet receive handler (function called when a new packet is received)
 //
-func (endPoint *EndPoint) OnPacketReceived(f func(packet *Packet)) *EndPoint {
+func (endPoint *EndPoint) OnPacketReceived(f func(packet *Packet) bool) *EndPoint {
 	endPoint.onPacketReceived = append(endPoint.onPacketReceived, f)
 	return endPoint
 }
@@ -96,6 +136,45 @@ func (endPoint *EndPoint) OnPacketReceived(f func(packet *Packet)) *EndPoint {
 func (endPoint *EndPoint) OnClose(f func(endPoint *EndPoint)) *EndPoint {
 	endPoint.onClose = append(endPoint.onClose, f)
 	return endPoint
+}
+
+// Add an handler for _Log messages
+//
+// The message has the following format
+//
+// _Log [Name={list of to log}] [Scope="EndPoint"|"Service"] [Disable=True|False]
+//
+// Default scope is Service (logging of this type will be applied to all EndPoint created by this service)
+// If no specific logger Names are given, MessageStream related logs along with a supplied list of logger names will be enabled (or disabled)
+//
+func (endPoint *EndPoint) AddLoggingHandler(defaultLoggers []string) *EndPoint {
+	return endPoint.OnPacketReceived(func(p *Packet) bool {
+		if p.GetType() == "_Log" {
+			disableLogging := p.Element.GetBoolAttribute("Disable", false)
+			scope := p.Element.GetAttribute("Scope", "Service")
+			name := p.Element.GetAttribute("Name", strings.Join(append([]string{LogEndPoint, LogMessages, LogService}, defaultLoggers...), ","))
+
+			if disableLogging {
+				if scope == "Service" && endPoint.Service != nil {
+					endPoint.Service.DisableLogging(name)
+				} else {
+					endPoint.DisableLogging(name)
+				}
+			} else {
+				if scope == "Service" && endPoint.Service != nil {
+					endPoint.Service.EnableLogging(name)
+				} else {
+					endPoint.EnableLogging(name)
+				}
+			}
+
+			_ = p.OptionalReply(&Attributes{"Type": "Log", "Name": strings.Join(endPoint.GetActiveLoggerNames(), ",")}).Send()
+
+			return true
+		} else {
+			return false
+		}
+	})
 }
 
 // Start (activate the end point)
@@ -112,6 +191,7 @@ func (endPoint *EndPoint) Start() *EndPoint {
 	go endPoint.sendPackets()
 	endPoint.started = true
 
+	endPoint.Log(LogEndPoint).Println("Started", endPoint)
 	return endPoint
 }
 
@@ -119,6 +199,8 @@ func (endPoint *EndPoint) Start() *EndPoint {
 //
 func (endPoint *EndPoint) Close() error {
 	var err error = nil
+
+	endPoint.Log(LogEndPoint).Println("Closed")
 
 	if endPoint.Connection != nil {
 		close(endPoint.sendChannel)
@@ -142,13 +224,12 @@ func (endPoint *EndPoint) Close() error {
 
 		endPoint.onPacketReceived = nil
 		endPoint.onClose = nil
-
-		log.Printf("MessageStream %v closed\n", endPoint.Name)
 	}
 
 	return err
 }
 
+// Is EndPoint connected
 func (endPoint *EndPoint) IsConnected() error {
 	if endPoint.Connection == nil {
 		return fmt.Errorf("EndPoint %v is not connected", endPoint)
@@ -156,8 +237,132 @@ func (endPoint *EndPoint) IsConnected() error {
 	return nil
 }
 
+// Is EndPoint started
 func (endPoint *EndPoint) IsStarted() bool {
 	return endPoint.started
+}
+
+// Get the Endpoint's name
+func (endPoint *EndPoint) Name() string {
+	return endPoint.name
+}
+
+// Set the EndPoint name
+func (endPoint *EndPoint) SetName(name string) *EndPoint {
+	endPoint.Log(LogEndPoint).Println("Set name to of ", endPoint, " to ", name)
+	endPoint.name = name
+	return endPoint
+}
+
+// Get a logger with a specific name.
+//
+// If the logger is enabled, a logger that does something is returned
+// If the logger is not enabled, a logger which does nothing is returned
+//
+// A typical usage:
+//
+//   endPoint.Log("LogTemperatures").Println("It is hot today")
+//
+// A logger can be enabled either in end point scope (only for this specific endpoint) or
+// in a service scope (for all endpoint created by the service)
+//
+func (endPoint *EndPoint) Log(name string) OptionalLogger {
+	logger := endPoint.getLogger(name)
+	if logger != nil {
+		return logger
+	}
+
+	return NullLogger{}
+}
+
+// Enable a logger with a given name. If logger is enabled then things of this type will be logged
+//
+// For example:
+//   endPoint.EnableLogger("Messages") will cause all messages received/sent by the end point to be logged
+//
+func (endPoint *EndPoint) EnableLogging(names string) *EndPoint {
+	if len(names) > 0 {
+		if endPoint.loggers == nil {
+			loggers := make(map[string]OptionalLogger)
+			endPoint.loggers = &loggers
+		}
+
+		namesList := strings.Split(names, ",")
+
+		for _, name := range namesList {
+			if _, found := (*endPoint.loggers)[name]; !found {
+				(*endPoint.loggers)[name] = log.New(log.Writer(), endPoint.String()+" ("+name+") ", log.Flags())
+			}
+		}
+	}
+
+	return endPoint
+}
+
+// Disable a logger with a given name. If logger is disable then things of this type will not be logged
+//
+// For example:
+//   endPoint.DisableLogger("Messages") will stop logging of all messages received/sent by the end point
+//
+func (endPoint *EndPoint) DisableLogging(names string) {
+	namesList := strings.Split(names, ",")
+
+	for _, name := range namesList {
+		if endPoint.loggers != nil {
+			delete(*endPoint.loggers, name)
+			if len(*endPoint.loggers) == 0 {
+				endPoint.loggers = nil
+			}
+		}
+	}
+}
+
+// Get a list of all the loggers which are enabled for this end point (this does not include loggers which are
+// enabled for the service)
+//
+func (endPoint *EndPoint) GetLoggerNames() []string {
+	if endPoint.loggers != nil {
+		result := make([]string, 0, len(*endPoint.loggers))
+
+		for name := range *endPoint.loggers {
+			result = append(result, name)
+		}
+
+		return result
+	}
+
+	return []string{}
+}
+
+// Get a list of all the logger which are enabled, both loggers which are enabled just for this end point and those
+// enabled for the service
+//
+func (endPoint *EndPoint) GetActiveLoggerNames() []string {
+	endPointLoggers := endPoint.GetLoggerNames()
+	serviceLoggers := []string{}
+
+	if endPoint.Service != nil {
+		serviceLoggers = endPoint.Service.GetLoggerNames()
+	}
+
+	return append(serviceLoggers, endPointLoggers...)
+}
+
+// Look for a looger with a specific name
+// return nil if logger with this name cannot be found
+//
+func (endPoint *EndPoint) getLogger(name string) OptionalLogger {
+	if endPoint.loggers != nil {
+		if logger, found := (*endPoint.loggers)[name]; found {
+			return logger
+		}
+	}
+
+	if endPoint.Service != nil {
+		return endPoint.Service.getLogger(name)
+	}
+
+	return nil
 }
 
 //
@@ -182,6 +387,7 @@ func NewService(name string, network string, address string, info interface{}, c
 		nextEndPointId: 0,
 		createEndPoint: createEndPoint,
 		Info:           info,
+		loggers:        nil,
 	}
 
 	go service.acceptStreams(network, address)
@@ -209,6 +415,99 @@ func (service *Service) Terminate() {
 	for _, endPoint := range endPoints {
 		endPoint.Close()
 	}
+}
+
+//
+// Logger functions
+//
+
+// Get a logger with a specific name.
+//
+// If the logger is enabled, a logger that does something is returned
+// If the logger is not enabled, a logger which does nothing is returned
+//
+// A typical usage:
+//
+//   service.Log("LogTemperatures").Println("It is hot today")
+//
+func (service *Service) Log(name string) OptionalLogger {
+	if logger := service.getLogger(name); logger != nil {
+		return logger
+	}
+
+	return NullLogger{}
+}
+
+// Enable a logger with a given name. If logger is enabled then things of this type will be logged
+//
+// For example:
+//   service.EnableLogger("Service") will cause all messages assocaited with service state to be logged
+//
+func (service *Service) EnableLogging(names string) *Service {
+	if len(names) > 0 {
+		if service.loggers == nil {
+			loggers := make(map[string]OptionalLogger)
+			service.loggers = &loggers
+		}
+
+		namesList := strings.Split(names, ",")
+
+		for _, name := range namesList {
+			if _, found := (*service.loggers)[name]; !found {
+				(*service.loggers)[name] = log.New(log.Writer(), service.Name+" ("+name+") ", log.Flags())
+			}
+		}
+	}
+
+	return service
+}
+
+// Disable a logger with a given name. If logger is disable then things of this type will not be logged
+//
+// For example:
+//   servicet.DisableLogger("Service") will stop logging of service state related messages
+//
+func (service *Service) DisableLogging(names string) {
+	namesList := strings.Split(names, ",")
+
+	for _, name := range namesList {
+		if service.loggers != nil {
+			delete(*service.loggers, name)
+			if len(*service.loggers) == 0 {
+				service.loggers = nil
+			}
+		}
+	}
+}
+
+// Get a list of all the loggers which are enabled for this service
+//
+func (service *Service) GetLoggerNames() []string {
+	if service.loggers != nil {
+		result := make([]string, 0, len(*service.loggers))
+
+		for name := range *service.loggers {
+			result = append(result, name)
+		}
+		return result
+	}
+
+	return []string{}
+}
+
+// Look for a looger with a specific name
+// return nil if logger with this name cannot be found
+//
+func (service *Service) getLogger(name string) OptionalLogger {
+	if service.loggers == nil {
+		return nil
+	}
+
+	if logger, found := (*service.loggers)[name]; found {
+		return logger
+	}
+
+	return nil
 }
 
 //
@@ -314,20 +613,16 @@ func (maybeRequestPacket *Packet) OptionalReply(content ...interface{}) *Packet 
 // Create exception packet
 //
 func (requestPacket *Packet) Exception(exception error, content ...interface{}) *Packet {
-	fmt.Println("EXCEPTION:", exception.Error())
 	if requestPacket.EndPoint != nil {
+		content = append(content, Attributes{"Description": exception.Error()})
 		if requestId, err := requestPacket.GetRequestId(); err == nil {
-			content = append(content, Attributes{"Description": exception.Error()})
 			content = append(content, Attributes{RequestIdAttributeName: requestId})
 			if requestPacket.EndPoint.UseCausality {
 				content = append(content, Attributes{CausalityAttributeName: requestId})
 			}
-
-			return requestPacket.EndPoint.newPacket("Exception", content)
-		} else {
-			log.Fatalln(err.Error())
-			return nil
 		}
+
+		return requestPacket.EndPoint.newPacket("Exception", content)
 	} else {
 		log.Fatalln("Trying to generate exception for packet with closed connection: ", requestPacket)
 		return nil
@@ -478,10 +773,12 @@ func (endPoint *EndPoint) receivePackets() {
 		packet.Element, err = decode(packetBytes)
 
 		if err != nil {
-			log.Fatalln(fmt.Sprintf("MessageStream %s error while decoding incoming packet %v", endPoint.Name, err))
+			log.Fatalln(fmt.Sprintf("MessageStream %s error while decoding incoming packet %v", endPoint.name, err))
 			fmt.Println("packetBytes length", len(packetBytes))
 			fmt.Println("packetBytes: ", packetBytes)
 		}
+
+		endPoint.Log(LogMessages).Println("Received: ", packet)
 
 		if packet.Element.Name == "Reply" || packet.Element.Name == "Exception" {
 			requestId := packet.Element.GetIntAttribute(RequestIdAttributeName, -1)
@@ -506,7 +803,9 @@ func (endPoint *EndPoint) receivePackets() {
 		} else {
 			if endPoint.onPacketReceived != nil {
 				for _, onPacketReceived := range endPoint.onPacketReceived {
-					onPacketReceived(&packet)
+					if onPacketReceived(&packet) {
+						break // If returned true, packet was handled - no need to call next inline
+					}
 				}
 			}
 		}
@@ -517,6 +816,7 @@ func (endPoint *EndPoint) receivePackets() {
 
 func (endPoint *EndPoint) sendPackets() {
 	for element := range endPoint.sendChannel {
+		endPoint.Log(LogMessages).Println("Sending: ", element)
 		packetBytes, err := element.encode()
 
 		if err != nil {
@@ -551,9 +851,10 @@ func (service *Service) acceptStreams(network string, address string) {
 		})
 
 		endPoint.Service = service
+
 		endPoint.Id = service.nextEndPointId
-		if endPoint.Name == "" {
-			endPoint.Name = service.Name + " " + strconv.Itoa(service.nextEndPointId)
+		if endPoint.name == "" {
+			endPoint.name = service.Name + " " + strconv.Itoa(service.nextEndPointId)
 		}
 
 		service.endPoints[endPoint.Id] = endPoint
@@ -563,7 +864,7 @@ func (service *Service) acceptStreams(network string, address string) {
 	}
 
 	service.listener = nil
-	log.Printf("MessageStream Service %v terminated\n", service.Name)
+	service.Log(LogService).Println("Terminated")
 }
 
 func (endPoint *EndPoint) lock(m string) {
@@ -619,7 +920,7 @@ func (endPoint *EndPoint) readPacketBytes() ([]byte, error) {
 }
 
 func (endPoint *EndPoint) String() string {
-	s := endPoint.Name
+	s := endPoint.name
 	info, hasInfo := endPoint.Info.(fmt.Stringer)
 
 	if hasInfo {
@@ -736,3 +1037,20 @@ func decodeToken(decoder *xml.Decoder, startElement xml.StartElement) (*Element,
 
 	return &element, nil
 }
+
+func (l NullLogger) Fatal(v ...interface{})            {}
+func (l NullLogger) Fatalf(f string, v ...interface{}) {}
+func (l NullLogger) Fatalln(v ...interface{})          {}
+func (l NullLogger) Flags() int                        { return 0 }
+func (l NullLogger) Output(depth int, s string) error  { return nil }
+func (l NullLogger) Panic(v ...interface{})            {}
+func (l NullLogger) Panicf(f string, v ...interface{}) {}
+func (l NullLogger) Panicln(v ...interface{})          {}
+func (l NullLogger) Prefix() string                    { return "" }
+func (l NullLogger) Print(v ...interface{})            {}
+func (l NullLogger) Printf(f string, v ...interface{}) {}
+func (l NullLogger) Println(v ...interface{})          {}
+func (l NullLogger) SetFlags(flag int)                 {}
+func (l NullLogger) SetOutput(w io.Writer)             {}
+func (l NullLogger) SetPrefix(prefix string)           {}
+func (l NullLogger) Writer() io.Writer                 { return nil }
