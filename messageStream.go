@@ -825,7 +825,9 @@ func (endPoint *EndPoint) sendPackets() {
 
 		err = endPoint.sendPacketBytes(packetBytes)
 		if err != nil {
-			panic(err)
+			endPoint.Log(LogEndPoint).Println("Packet write error: ", err, " - closing endPoint")
+			endPoint.Close()
+			break
 		}
 	}
 }
